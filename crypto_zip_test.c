@@ -23,6 +23,7 @@
 #include <asm/smp.h>
 #include <linux/crypto.h>
 #include <linux/debugfs.h>
+#include <linux/delay.h>
 #include <linux/err.h>
 #include <linux/fs.h>
 #include <linux/kernel.h>
@@ -461,7 +462,7 @@ err_free:
  */
 static int test_case_4(int param)
 {
-	struct comp_testvec *test_vec;
+	const struct comp_testvec *test_vec;
 	struct crypto_comp *tfm;
 	const char *alg;
 	char *decomp_out_buf;
@@ -646,26 +647,38 @@ static int test_case_7(int param)
 
 err_return:
 	return ret;
+#undef DEFAULT_THREAD_NUM
 }
 
 /* this is the thread function for case 8 */
 static int do_compress_c8(void *date)
 {
 	struct crypto_comp *tfm;
+	char *comp_out_buf;
 	char *decomp_out_buf;
 	char self_name[TASK_COMM_LEN];
+	int comp_out_size = 512;
 	int decomp_out_size = 512;
 	int ret = 0, i;
+	int comp_n = 0, decomp_n = 0;
 
 	get_task_comm(self_name, current);
 	self_name[TASK_COMM_LEN - 1] = 0;
 
-	pr_info("%s is running on cpu-%d\n", self_name, smp_processor_id());
+	pr_info("%s is running on cpu-%d node-%d\n", self_name,
+		smp_processor_id(), cpu_to_node(smp_processor_id()));
+
+	comp_out_buf = kmalloc(comp_out_size, GFP_KERNEL);
+	if (!comp_out_buf) {
+		pr_info("zip: fail to allocate comp out buffer\n");
+		return -1;
+	}
 
 	decomp_out_buf = kmalloc(decomp_out_size, GFP_KERNEL);
 	if (!decomp_out_buf) {
 		pr_info("zip: fail to allocate decomp out buffer\n");
 		return -1;
+		goto err_free_comp;
 	}
 
 	tfm = crypto_alloc_comp("zlib-deflate", CRYPTO_ALG_TYPE_COMPRESS, 0xf);
@@ -675,19 +688,31 @@ static int do_compress_c8(void *date)
 		goto err_free_decomp;
 	}
 
-	for (i = 0; i < 1000; i++) {
-		decomp_out_size = 512;
-		memset(decomp_out_buf, 0, decomp_out_size);
-		ret = crypto_comp_decompress(tfm, zlib_comp.output,
-					     zlib_comp.outlen, decomp_out_buf,
-					     &decomp_out_size);
+	for (i = 0; i < 3000; i++) {
+		comp_out_size = 512;
+		memset(comp_out_buf, 0, comp_out_size);
+		ret = crypto_comp_compress(tfm, zlib_comp.input,
+					   zlib_comp.inlen, comp_out_buf,
+					   &comp_out_size);
 		if (ret) {
-			pr_info("zip: failed to compress, ret = %d\n", ret);
+			pr_info("zip: failed to compress in %dth, ret = %d\n", i, ret);
 			goto err_free_tfm;
 		}
+		comp_n++;
+
+		decomp_out_size = 512;
+		memset(decomp_out_buf, 0, decomp_out_size);
+		ret = crypto_comp_decompress(tfm, comp_out_buf,
+					     comp_out_size, decomp_out_buf,
+					     &decomp_out_size);
+		if (ret) {
+			pr_info("zip: failed to decompress in %dth, ret = %d: %d\n", i, ret, comp_out_size);
+			goto err_free_tfm;
+		}
+		decomp_n++;
 
 		if (memcmp(decomp_out_buf, zlib_comp.input, zlib_comp.inlen)) {
-			pr_info("zip: memcmp failed!");
+			pr_info("zip: memcmp failed!: %s in %dth: %d, %d\n", self_name, i, comp_out_size, decomp_out_size);
 			ret = -1;
 			goto err_free_tfm;
 		}
@@ -697,6 +722,13 @@ err_free_tfm:
 	crypto_free_comp(tfm);
 err_free_decomp:
 	kfree(decomp_out_buf);
+err_free_comp:
+	kfree(comp_out_buf);
+
+	pr_info("%s comp: %d, decomp: %d\n", self_name, comp_n, decomp_n);
+
+	while (!kthread_should_stop())
+		schedule();
 
 	return ret;
 }
@@ -709,27 +741,39 @@ err_free_decomp:
  */
 static int test_case_8(int param)
 {
-#define DEFAULT_THREAD_NUM		32
+/* change this define to cover different cases */
+#define DEFAULT_THREAD_NUM		256
 	struct task_struct *thread_array[DEFAULT_THREAD_NUM];
-	int ret = 0, t;
+	int ret = 0, t, j;
 
 	for (t = 0; t < DEFAULT_THREAD_NUM; t++) {
-		pr_info("thread-%d is on numa node %d\n", t, cpu_to_node(smp_processor_id()));
 		thread_array[t] =
 		kthread_create_on_node(do_compress_c8, NULL,
 				       cpu_to_node(smp_processor_id()),
-				       "zip_tc8_t%u", t);
+				       "zip_tc8_t%d", t);
 		if (IS_ERR(thread_array[t])) {
 			pr_info("zip: fail to create kthread %d\n", t);
 			ret = -EPERM;
 			goto err_return;
 		}
+		kthread_bind(thread_array[t], t % 128);
 
 		wake_up_process(thread_array[t]);
 	}
 
-err_return:
+	msleep(5000);
+
+	for (t = 0; t < DEFAULT_THREAD_NUM; t++)
+		ret += kthread_stop(thread_array[t]);
+
+	/* if all threads OK, this test case is successful */
 	return ret;
+
+err_return:
+	for (j = 0; j < t; j++)
+		kthread_stop(thread_array[j]);
+	return ret;
+#undef DEFAULT_THREAD_NUM
 }
 
 /**
@@ -800,7 +844,6 @@ static int test_case_13(int param)
 	int ret = 0, i, j;
 
 	for (i = 0; i < TFM_NUM; i++) {
-//	for (i = 0; i < 32; i++) {
 		tfm_array[i] = crypto_alloc_comp("zlib-deflate",
 						 CRYPTO_ALG_TYPE_COMPRESS, 0xf);
 		if (IS_ERR(tfm_array[i])) {
@@ -837,6 +880,8 @@ err_free_tfm:
 		crypto_free_comp(tfm_array[j]);
 
 	return ret;
+#undef DEFAULT_PF_Q_NUM
+#undef TFM_NUM
 }
 
 /* use "char data_1k[SZ_1K]" 1K data to create big data, e.g. 2M, 4M... */
@@ -1066,6 +1111,8 @@ err_free_tfm:
 	kfree(tfm_array);
 
 	return ret;
+#undef DEFAULT_PF_Q_NUM
+#undef TFM_NUM
 }
 
 /*
@@ -1095,7 +1142,7 @@ err_free_tfm:
 
 /* Test cases end. */
 
-static void hisi_zip_crypto_unregister_test_case(int n)
+inline static void hisi_zip_crypto_unregister_test_case(int n)
 {
 	hisi_zip_test_cases[n].fun = NULL;
 	hisi_zip_test_cases[n].case_num = -1;
@@ -1312,7 +1359,7 @@ static void hisi_zip_test_control_unregister(void)
 
 static int __init test_init(void)
 {
-	struct test_cmd cmd;
+	struct test_cmd cmd = {0};
 	int ret;
 
 	pr_info("zip: module init\n");
