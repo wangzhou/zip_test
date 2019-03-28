@@ -372,8 +372,14 @@ static int test_case_3(int param)
 	int decomp_out_size = 512;
 	struct z_stream_s stream;
 	int ret = 0;
-	u32 run_times = 10000;
+	u32 run_times = 10000000;
 	int i;
+
+	struct statis {
+		int right_req;
+		int wrong_req;
+		int reset_req;
+	} s = {0};
 
 	out_buf = kmalloc(out_size, GFP_KERNEL);
 	if (!out_buf) {
@@ -399,9 +405,11 @@ static int test_case_3(int param)
 		out_size = 512;
 		ret = crypto_comp_compress(tfm, zlib_comp.input, zlib_comp.inlen,
 					   out_buf, &out_size);
-		if (ret) {
+		if (ret == -EAGAIN || ret == -ETIME) {
 			pr_info("zip: failed to compress, ret = %d\n", ret);
-			goto err_free_tfm;
+			s.reset_req++;
+			msleep(500);
+			continue;
 		}
 
 		/* software decompression starts */
@@ -434,10 +442,15 @@ static int test_case_3(int param)
 
 		if (memcmp(decomp_out_buf, zlib_comp.input, zlib_comp.inlen)) {
 			pr_info("zip: test case 3 fails");
+			s.wrong_req++;
 			ret = -1;
 			goto err_free_tfm;
+		} else {
+			s.right_req++;
 		}
 	}
+
+	pr_info("right: %d, wrong: %d, reset: %d\n", s.right_req, s.wrong_req, s.reset_req);
 
 	goto err_free_tfm;
 
