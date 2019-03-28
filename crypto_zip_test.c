@@ -744,7 +744,7 @@ err_free_comp:
 static int test_case_8(int param)
 {
 /* change this define to cover different cases */
-#define DEFAULT_THREAD_NUM		32
+#define DEFAULT_THREAD_NUM		512
 	struct task_struct *thread_array[DEFAULT_THREAD_NUM];
 	int ret = 0, t, j;
 
@@ -1122,14 +1122,12 @@ struct acomp_statis {
 	int wrong_req;
 };
 
-struct acomp_statis acomp_statis = {0};
-spinlock_t s_lock;
-
 struct acomp_info {
 	void *input;
 	char *output;
 	struct acomp_req *req;
 	struct acomp_statis *s;
+	spinlock_t *s_lock;
 	int req_id;
 };
 
@@ -1183,14 +1181,14 @@ static void acomp_req_done(struct crypto_async_request *base, int err)
 
 	ret = memcmp(decomp_out_buf, zlib_comp.input, zlib_comp.inlen);
 
-	spin_lock(&s_lock);
+	spin_lock(addr->s_lock);
 	if (ret) {
 		pr_info("zip: test case fails: req_id: %u\n", addr->req_id);
 		s->wrong_req++;
 	} else {
 		s->right_req++;
 	}
-	spin_unlock(&s_lock);
+	spin_unlock(addr->s_lock);
 
 end_stream:
 	zlib_deflateEnd(&stream);
@@ -1229,6 +1227,8 @@ static int test_case_21(int param)
 	int out_size = 512;
 	struct scatterlist *src, *dst;
 	struct acomp_info *addr;
+	struct acomp_statis acomp_statis = {0};
+	spinlock_t s_lock;
 	int ret = 0, i;
 
 	spin_lock_init(&s_lock);
@@ -1289,6 +1289,7 @@ static int test_case_21(int param)
 		addr->req = req;
 		addr->s = &acomp_statis;
 		addr->req_id = i;
+		addr->s_lock = &s_lock;
 
 		acomp_request_set_params(req, src, dst, zlib_comp.inlen,
 					 out_size);
@@ -1325,6 +1326,318 @@ free_acomp:
 #undef DEFAULT_PF_Q_NUM
 #undef TFM_NUM
 }
+
+/* test case 22 callback */
+static void acomp_req_done_decomp(struct crypto_async_request *base, int err)
+{
+	struct acomp_info *addr = base->data;
+	struct acomp_req *req = addr->req;
+	struct acomp_statis *s = addr->s;
+	int buf_size = 512;
+	char *out_buf;
+	int ret = 0;
+
+	out_buf = kcalloc(1, buf_size, GFP_KERNEL);
+	if (!out_buf)
+		pr_err("zip: fail to allocate memory\n");
+
+	sg_copy_to_buffer(req->dst, sg_nents(req->dst), out_buf, req->dlen);
+
+	ret = memcmp(out_buf, zlib_comp.input, zlib_comp.inlen);
+
+	spin_lock(addr->s_lock);
+	if (ret) {
+		pr_info("zip: test case fails: req_id: %u\n", addr->req_id);
+		s->wrong_req++;
+	} else {
+		s->right_req++;
+	}
+	spin_unlock(addr->s_lock);
+
+	kfree(out_buf);
+
+	/* free case_22 allocated resource */
+	kfree(addr->input);
+	kfree(addr->output);
+	kfree(addr);
+	kfree(req->src);
+	kfree(req->dst);
+	acomp_request_free(req);
+	return;
+}
+
+/**
+ * Test case 22 - basic acomp test case, software comp and hardware decomp.
+ *
+ * Send acomp req to do decompression, and in callback to do comparation.
+ */
+static int test_case_22(int param)
+{
+#define DEFAULT_PF_Q_NUM		2
+#define TFM_NUM				(DEFAULT_PF_Q_NUM / 2)
+#define REQ_NUM				3000
+	struct crypto_acomp *acomp;
+	struct acomp_req *req;
+	void *input;
+	char *out_buf;
+	int out_size = 512;
+	struct scatterlist *src, *dst;
+	struct acomp_info *addr;
+	struct acomp_statis acomp_statis = {0};
+	spinlock_t s_lock;
+	int ret = 0, i;
+
+	spin_lock_init(&s_lock);
+
+	acomp = crypto_alloc_acomp("zlib-deflate", CRYPTO_ALG_TYPE_ACOMPRESS,
+				   CRYPTO_ALG_TYPE_ACOMPRESS_MASK);
+	if (IS_ERR(acomp)) {
+		pr_err("zip: fail to create acomp tfm\n");
+		return PTR_ERR(acomp);
+	}
+
+	/* let's send REQ_NUM comp and REQ_NUM decomp reqs */
+	for (i = 0; i < REQ_NUM; i++) {
+		src = kcalloc(1, sizeof(struct scatterlist), GFP_KERNEL);
+		if (!src) {
+			ret = -ENOMEM;
+			goto free_acomp;
+		}
+
+		dst = kcalloc(1, sizeof(struct scatterlist), GFP_KERNEL);
+		if (!dst) {
+			ret = -ENOMEM;
+			goto free_src;
+		}
+
+		input = kmemdup(zlib_comp.output, zlib_comp.outlen, GFP_KERNEL);
+		if (!input) {
+			ret = -ENOMEM;
+			goto free_dst;
+		}
+
+		out_buf = kmalloc(out_size, GFP_KERNEL);
+		if (!out_buf) {
+			pr_info("zip: fail to allocate out buffer\n");
+			ret = -ENOMEM;
+			goto free_input;
+		}
+		memset(out_buf, 0, out_size);
+
+		addr = kmalloc(sizeof(struct acomp_info), GFP_KERNEL);
+		if (!addr) {
+			ret = -ENOMEM;
+			goto free_out_buf;
+		}
+
+		sg_init_one(src, input, zlib_comp.outlen);
+		sg_init_one(dst, out_buf, out_size);
+
+		req = acomp_request_alloc(acomp);
+		if (!req) {
+			pr_err("zip: request req failed\n");
+			ret = -ENOMEM;
+			goto free_addr;
+		}
+
+		addr->input = input;
+		addr->output = out_buf;
+		addr->req = req;
+		addr->s = &acomp_statis;
+		addr->req_id = i;
+		addr->s_lock = &s_lock;
+
+		acomp_request_set_params(req, src, dst, zlib_comp.outlen,
+					 out_size);
+		acomp_request_set_callback(req, 0, acomp_req_done_decomp, addr);
+
+		crypto_acomp_decompress(req);
+	}
+
+	/* wait all reqs finished */
+	msleep(5000);
+
+	pr_info("zip: wrong req: %u\n", acomp_statis.wrong_req);
+	pr_info("zip: right req: %u\n", acomp_statis.right_req);
+
+	if (acomp_statis.wrong_req)
+		ret = -1;
+
+	goto free_acomp;
+
+free_addr:
+	kfree(addr);
+free_out_buf:
+	kfree(out_buf);
+free_input:
+	kfree(input);
+free_dst:
+	kfree(dst);
+free_src:
+	kfree(src);
+free_acomp:
+	crypto_free_acomp(acomp);
+	return ret;
+#undef REQ_NUM
+#undef DEFAULT_PF_Q_NUM
+#undef TFM_NUM
+}
+
+#if 0
+/* test case 23 callback */
+static void acomp_req_done_decomp(struct crypto_async_request *base, int err)
+{
+	struct acomp_info *addr = base->data;
+	struct acomp_req *req = addr->req;
+	struct acomp_statis *s = addr->s;
+	int buf_size = 512;
+	char *out_buf;
+	int ret = 0;
+
+	out_buf = kcalloc(1, buf_size, GFP_KERNEL);
+	if (!out_buf)
+		pr_err("zip: fail to allocate memory\n");
+
+	sg_copy_to_buffer(req->dst, sg_nents(req->dst), out_buf, req->dlen);
+
+	ret = memcmp(out_buf, zlib_comp.input, zlib_comp.inlen);
+
+	spin_lock(addr->s_lock);
+	if (ret) {
+		pr_info("zip: test case fails: req_id: %u\n", addr->req_id);
+		s->wrong_req++;
+	} else {
+		s->right_req++;
+	}
+	spin_unlock(addr->s_lock);
+
+	kfree(out_buf);
+
+	/* free case_22 allocated resource */
+	kfree(addr->input);
+	kfree(addr->output);
+	kfree(addr);
+	kfree(req->src);
+	kfree(req->dst);
+	acomp_request_free(req);
+	return;
+}
+
+/**
+ * Test case 23 - basic acomp test case, hardware comp and hardware decomp.
+ */
+static int test_case_23(int param)
+{
+#define DEFAULT_PF_Q_NUM		2
+#define TFM_NUM				(DEFAULT_PF_Q_NUM / 2)
+#define REQ_NUM				3000
+	struct crypto_acomp *acomp;
+	struct acomp_req *req;
+	void *input;
+	char *out_buf;
+	int out_size = 512;
+	struct scatterlist *src, *dst;
+	struct acomp_info *addr;
+	struct acomp_statis acomp_statis = {0};
+	spinlock_t s_lock;
+	int ret = 0, i;
+
+	spin_lock_init(&s_lock);
+
+	acomp = crypto_alloc_acomp("zlib-deflate", CRYPTO_ALG_TYPE_ACOMPRESS,
+				   CRYPTO_ALG_TYPE_ACOMPRESS_MASK);
+	if (IS_ERR(acomp)) {
+		pr_err("zip: fail to create acomp tfm\n");
+		return PTR_ERR(acomp);
+	}
+
+	/* let's send REQ_NUM comp and REQ_NUM decomp reqs */
+	for (i = 0; i < REQ_NUM; i++) {
+		src = kcalloc(1, sizeof(struct scatterlist), GFP_KERNEL);
+		if (!src) {
+			ret = -ENOMEM;
+			goto free_acomp;
+		}
+
+		dst = kcalloc(1, sizeof(struct scatterlist), GFP_KERNEL);
+		if (!dst) {
+			ret = -ENOMEM;
+			goto free_src;
+		}
+
+		input = kmemdup(zlib_comp.output, zlib_comp.outlen, GFP_KERNEL);
+		if (!input) {
+			ret = -ENOMEM;
+			goto free_dst;
+		}
+
+		out_buf = kmalloc(out_size, GFP_KERNEL);
+		if (!out_buf) {
+			pr_info("zip: fail to allocate out buffer\n");
+			ret = -ENOMEM;
+			goto free_input;
+		}
+		memset(out_buf, 0, out_size);
+
+		addr = kmalloc(sizeof(struct acomp_info), GFP_KERNEL);
+		if (!addr) {
+			ret = -ENOMEM;
+			goto free_out_buf;
+		}
+
+		sg_init_one(src, input, zlib_comp.outlen);
+		sg_init_one(dst, out_buf, out_size);
+
+		req = acomp_request_alloc(acomp);
+		if (!req) {
+			pr_err("zip: request req failed\n");
+			ret = -ENOMEM;
+			goto free_addr;
+		}
+
+		addr->input = input;
+		addr->output = out_buf;
+		addr->req = req;
+		addr->s = &acomp_statis;
+		addr->req_id = i;
+		addr->s_lock = &s_lock;
+
+		acomp_request_set_params(req, src, dst, zlib_comp.outlen,
+					 out_size);
+		acomp_request_set_callback(req, 0, acomp_req_done_decomp, addr);
+
+		crypto_acomp_decompress(req);
+	}
+
+	/* wait all reqs finished */
+	msleep(5000);
+
+	pr_info("zip: wrong req: %u\n", acomp_statis.wrong_req);
+	pr_info("zip: right req: %u\n", acomp_statis.right_req);
+
+	if (acomp_statis.wrong_req)
+		ret = -1;
+
+	goto free_acomp;
+
+free_addr:
+	kfree(addr);
+free_out_buf:
+	kfree(out_buf);
+free_input:
+	kfree(input);
+free_dst:
+	kfree(dst);
+free_src:
+	kfree(src);
+free_acomp:
+	crypto_free_acomp(acomp);
+	return ret;
+#undef REQ_NUM
+#undef DEFAULT_PF_Q_NUM
+#undef TFM_NUM
+}
+#endif
 
 /*
  * to do: test cases will be added:
@@ -1606,6 +1919,9 @@ static int __init test_init(void)
 
 	/* add acomp test case */
 	hisi_zip_crypto_register_test_case(21, test_case_21);
+	hisi_zip_crypto_register_test_case(22, test_case_22);
+//	hisi_zip_crypto_register_test_case(23, test_case_23);
+//	hisi_zip_crypto_register_test_case(24, test_case_24);
 
 	hisi_zip_crypto_test_main(cmd);
 
