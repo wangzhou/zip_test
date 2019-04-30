@@ -1652,6 +1652,42 @@ free_acomp:
 }
 #endif
 
+/**
+ * Test case 25 - Allocates 30 comp tfms(60 qps), but not do compression, and
+ *		  then allocate 2 comp tfms(4 qps) and do compression.
+ *
+ * Prepare condition: insmod hisi_zip.ko pf_q_num=60 in 2P system.
+ * Test goal: test if we can allocate in another pf when first pf's q are busy.
+ * Expected result: Print "zip: test case 25 is end and successful"
+ */
+static int test_case_25(int param)
+{
+#define DEFAULT_PF_Q_NUM		64
+#define DEFAULT_TFM			(DEFAULT_PF_Q_NUM / 2)
+	struct crypto_comp *tfm_array[DEFAULT_PF_Q_NUM];
+	int ret = 0, i, j;
+
+	for (i = 0; i < DEFAULT_TFM - 2; i++) {
+		tfm_array[i] = crypto_alloc_comp("zlib-deflate",
+					CRYPTO_ALG_TYPE_COMPRESS, 0xf);
+		if (IS_ERR(tfm_array[i])) {
+			pr_info("zip: fail to create comp tfm: %u-tfm\n", i);
+			for (j = 0; j < i; j++)
+				crypto_free_comp(tfm_array[j]);
+
+			return -2;
+		}
+	}
+
+	test_case_1(0);
+
+	for (i = 0; i < DEFAULT_TFM - 2; i++) {
+		crypto_free_comp(tfm_array[i]);
+	}
+
+	return ret;
+}
+
 /*
  * to do: test cases will be added:
  *
@@ -1935,6 +1971,7 @@ static int __init test_init(void)
 	hisi_zip_crypto_register_test_case(22, test_case_22);
 //	hisi_zip_crypto_register_test_case(23, test_case_23);
 //	hisi_zip_crypto_register_test_case(24, test_case_24);
+	hisi_zip_crypto_register_test_case(25, test_case_25);
 
 	hisi_zip_crypto_test_main(cmd);
 
