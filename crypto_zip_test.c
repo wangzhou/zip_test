@@ -1545,6 +1545,180 @@ err_return:
 #undef DEFAULT_THREAD_NUM
 }
 
+/* begin of test case 24 */
+/**
+ * Test case 24 - basic acomp test case, hardware comp and software decomp.
+ *
+ * Send acomp req to do compression, and test performance. this is based on
+ * test case 21.
+ */
+#define DEFAULT_THREAD_NUM		10
+#define REQ_NUM				3000
+
+struct t24_wq {
+	wait_queue_head_t wq;
+	atomic_t count;
+} t24_wq = {0};
+
+struct per_thread_data {
+	void *input[REQ_NUM];
+	char *out_buf[REQ_NUM];
+	struct scatterlist *src[REQ_NUM], *dst[REQ_NUM];
+	struct acomp_info *addr[REQ_NUM];
+	struct acomp_statis acomp_statis;
+};
+
+static void acomp_req_done_24(struct crypto_async_request *base, int err)
+{
+	struct acomp_info *addr = base->data;
+	struct acomp_req *req = addr->req;
+	struct acomp_statis *s = addr->s;
+
+	s->right_req++;
+	if (s->right_req + s->wrong_req + s->fail_send_req == REQ_NUM) {
+		atomic_dec(&t24_wq.count);
+		wake_up(&t24_wq.wq);
+	}
+
+	acomp_request_free(req);
+}
+
+static int do_compress_c24(void *p_data)
+{
+	struct per_thread_data *data = p_data;
+	struct crypto_acomp *acomp;
+	struct acomp_req *req;
+	int out_size = SZ_8K;
+	int ret_s = 0, i;
+
+	acomp = crypto_alloc_acomp("zlib-deflate", CRYPTO_ALG_TYPE_ACOMPRESS,
+				   CRYPTO_ALG_TYPE_ACOMPRESS_MASK);
+	if (IS_ERR(acomp)) {
+		pr_err("zip: fail to create acomp tfm\n");
+		return PTR_ERR(acomp);
+	}
+
+	/* let's send REQ_NUM comp and REQ_NUM decomp reqs */
+	for (i = 0; i < REQ_NUM; i++) {
+		sg_init_one(data->src[i], data->input[i], SZ_8K);
+		sg_init_one(data->dst[i], data->out_buf[i], out_size);
+
+		req = acomp_request_alloc(acomp);
+		if (!req) {
+			pr_err("zip: request req failed\n");
+			return -ENOMEM;
+		}
+
+		data->addr[i]->req = req;
+		data->addr[i]->s = &data->acomp_statis;
+
+		acomp_request_set_params(req, data->src[i], data->dst[i], SZ_8K,
+					 out_size);
+		acomp_request_set_callback(req, 0, acomp_req_done_24, data->addr[i]);
+
+		ret_s = crypto_acomp_compress(req);
+		if (ret_s < 0 && ret_s != -EINPROGRESS)
+			data->acomp_statis.fail_send_req++;
+	}
+
+	msleep(5000);
+	crypto_free_acomp(acomp);
+	return 0;
+}
+
+static int test_case_24(int param)
+{
+	struct task_struct *thread_array[DEFAULT_THREAD_NUM];
+	struct per_thread_data *data_array[DEFAULT_THREAD_NUM];
+	struct timespec begin;
+	struct timespec end;
+	unsigned long val;
+	unsigned long throughput;
+	unsigned long right_req = 0;
+	int ret = 0, t, i, k;
+	char *in_buf;
+
+	/* init wait q */
+	init_waitqueue_head(&t24_wq.wq);
+	atomic_set(&t24_wq.count, DEFAULT_THREAD_NUM);
+
+	/* <--- prepare date begin --->  */
+
+	/* create input buffer date */
+	in_buf = kmalloc(SZ_8K, GFP_KERNEL);
+	if (!in_buf)
+		return -ENOMEM;
+	create_data(in_buf, SZ_8K);
+
+	for (i = 0; i < DEFAULT_THREAD_NUM; i++) {
+		data_array[i] = kcalloc(1, sizeof(struct per_thread_data),
+					GFP_KERNEL);
+		if (!data_array[i])
+			pr_info("zip: error a\n");
+
+		for (k = 0; k < REQ_NUM; k++) {
+			/* to do: error handle */
+			data_array[i]->src[k] = kcalloc(1, sizeof(struct scatterlist), GFP_KERNEL);
+			data_array[i]->dst[k] = kcalloc(1, sizeof(struct scatterlist), GFP_KERNEL);
+			data_array[i]->input[k] = kmemdup(in_buf, SZ_8K, GFP_KERNEL);
+			data_array[i]->out_buf[k] = kmalloc(SZ_8K, GFP_KERNEL);
+			data_array[i]->addr[k] = kmalloc(sizeof(struct acomp_info), GFP_KERNEL);
+		}
+	}
+	/* <--- prepare date end --->  */
+
+	getnstimeofday(&begin);
+
+	for (t = 0; t < DEFAULT_THREAD_NUM; t++) {
+		thread_array[t] =
+		kthread_create_on_node(do_compress_c24, data_array[t],
+				       cpu_to_node(smp_processor_id()),
+				       "zip_tc24_t%d", t);
+		if (IS_ERR(thread_array[t])) {
+			pr_info("zip: fail to create kthread %d\n", t);
+			ret = -EPERM;
+			goto err_return;
+		}
+		kthread_bind(thread_array[t], t % 128);
+
+		wake_up_process(thread_array[t]);
+	}
+
+	wait_event_interruptible(t24_wq.wq, atomic_read(&t24_wq.count) == 0);
+
+	getnstimeofday(&end);
+
+	/* get number of right req */
+	for (i = 0; i < DEFAULT_THREAD_NUM; i++)
+		right_req += data_array[i]->acomp_statis.right_req;
+
+	/* get throughput */
+	val = timespec_to_ns(&end) - timespec_to_ns(&begin);
+	throughput =
+	right_req * SZ_8K * 1000000000 / (val * 1024 * 1024);
+
+	/* free date */
+	for (i = 0; i < DEFAULT_THREAD_NUM; i++) {
+		for (k = 0; k < REQ_NUM; k++) {
+			kfree(data_array[i]->src[k]);
+			kfree(data_array[i]->dst[k]);
+			kfree(data_array[i]->input[k]);
+			kfree(data_array[i]->out_buf[k]);
+			kfree(data_array[i]->addr[k]);
+		}
+
+		kfree(data_array[i]);
+	}
+
+	return 0;
+
+err_return:
+	/* fix me: error handle */
+	return ret;
+}
+#undef DEFAULT_THREAD_NUM
+#undef REQ_NUM
+
 /**
  * Test case 25 - Allocates 30 comp tfms(60 qps), but not do compression, and
  *		  then allocate 2 comp tfms(4 qps) and do compression.
@@ -1863,7 +2037,7 @@ static int __init test_init(void)
 	hisi_zip_crypto_register_test_case(21, test_case_21);
 	hisi_zip_crypto_register_test_case(22, test_case_22);
 	hisi_zip_crypto_register_test_case(23, test_case_23);
-//	hisi_zip_crypto_register_test_case(24, test_case_24);
+	hisi_zip_crypto_register_test_case(24, test_case_24);
 	hisi_zip_crypto_register_test_case(25, test_case_25);
 
 	hisi_zip_crypto_test_main(cmd);
