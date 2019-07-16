@@ -1133,6 +1133,7 @@ err_free_tfm:
 struct acomp_statis {
 	int right_req;
 	int wrong_req;
+	int fail_send_req;
 };
 
 struct acomp_info {
@@ -1398,7 +1399,7 @@ static int test_case_22(int param)
 	struct acomp_info *addr;
 	struct acomp_statis acomp_statis = {0};
 	spinlock_t s_lock;
-	int ret = 0, i;
+	int ret = 0, ret_s = 0, i;
 
 	spin_lock_init(&s_lock);
 
@@ -1464,7 +1465,9 @@ static int test_case_22(int param)
 					 out_size);
 		acomp_request_set_callback(req, 0, acomp_req_done_decomp, addr);
 
-		crypto_acomp_decompress(req);
+		ret_s = crypto_acomp_decompress(req);
+		if (ret_s < 0 && ret_s != -EINPROGRESS)
+			acomp_statis.fail_send_req++;
 	}
 
 	/* wait all reqs finished */
@@ -1472,6 +1475,7 @@ static int test_case_22(int param)
 
 	pr_info("zip: wrong req: %u\n", acomp_statis.wrong_req);
 	pr_info("zip: right req: %u\n", acomp_statis.right_req);
+	pr_info("zip: fail send req: %u\n", acomp_statis.fail_send_req);
 
 	if (acomp_statis.wrong_req)
 		ret = -1;
